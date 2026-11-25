@@ -186,10 +186,6 @@ The portal enriches these with approximate **location/provider** (from DB-IP's f
 
 More: **[Security model](docs/security-model.md)**.
 
-### What never belongs in this repo
-
-`DOToken`, `keys/`, `.state/`, `profiles/`, `backups/`, `users.txt` and any built PDF are all git-ignored. They contain tokens, private keys, server addresses and personal data. Keep your working copy of them backed up somewhere safe and private.
-
 ## Documentation
 
 Detailed per-feature docs live in [`docs/`](docs/) and mirror the project wiki:
