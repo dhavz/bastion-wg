@@ -31,12 +31,6 @@
 - **Secrets at rest.** The mail password and the audit log live in `.state/portal.db`, which
   is git-ignored.
 
-## What must never be committed
-
-`DOToken`, `keys/`, `.state/`, `profiles/`, `backups/`, `users.txt`, and any generated PDF are
-all in `.gitignore`. They contain API tokens, private keys, server addresses and personal
-data. This public repository ships **code and documentation only**.
-
 ## Threat notes
 
 - The management machine is the crown jewel: it holds the SSH key and the only off-droplet

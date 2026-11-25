@@ -46,6 +46,6 @@ The new droplet gets a **new IP**, so:
 The portal's own data — accounts, settings and the **audit log** — lives in
 `.state/portal.db` on the management machine, not on the server, so it is not part of a server
 backup. Keep your whole management-machine working copy (including `.state/`, `keys/`,
-`profiles/`) backed up somewhere safe and private; these are git-ignored for good reason.
+`profiles/`) backed up somewhere safe and private.
 
 > `backups/` is the only copy of the server keys that exists off the droplet. Guard it.
