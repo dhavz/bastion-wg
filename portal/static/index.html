@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bastion</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310233a'/%3E%3Cpath d='M6 16h20M16 9l7 7-7 7' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- Sign in -->
+<main id="login" class="login" hidden>
+  <form id="login-form" class="glass login-card" autocomplete="off">
+    <h1>Bastion</h1>
+    <p class="muted">Sign in to manage the server and its users.</p>
+    <label for="username">Username</label>
+    <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <p id="login-error" class="error" role="alert"></p>
+    <button class="btn primary wide" type="submit">Sign in</button>
+    <p class="hint">The first account is <code>admin</code>. Its starting password is shown by running <code>./portal.sh password</code> in the project folder. Locked out? <code>./portal.sh new-password</code> resets it.</p>
+  </form>
+</main>
+
+<!-- Portal -->
+<div id="app" hidden>
+  <header class="topbar glass">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>Bastion</span>
+    </div>
+    <nav class="tabs" aria-label="Sections">
+      <button data-tab="overview" class="tab">Overview</button>
+      <button data-tab="users" class="tab">Users</button>
+      <button data-tab="usage" class="tab">Usage</button>
+      <button data-tab="websites" class="tab">Websites</button>
+      <button data-tab="server" class="tab">Server</button>
+      <button data-tab="activity" class="tab">Activity</button>
+      <button data-tab="admin" class="tab admin-only">Administration</button>
+    </nav>
+    <div class="topbar-right">
+      <span id="top-status" class="status"></span>
+      <button id="me-btn" class="btn quiet" title="Your account"></button>
+      <button id="signout" class="btn quiet">Sign out</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <main class="page">
+    <!-- Overview -->
+    <section id="tab-overview" class="view" hidden>
+      <div class="glass route" id="route"></div>
+      <div class="tiles" id="tiles"></div>
+      <div class="split">
+        <div class="glass panel">
+          <div class="panel-head">
+            <div>
+              <h2>Traffic through the VPN</h2>
+              <p class="muted">All users combined, last 12 minutes while this page is open</p>
+            </div>
+            <div class="legend" aria-label="Legend">
+              <span><i class="swatch" style="background:var(--series-down)"></i>Download to users</span>
+              <span><i class="swatch" style="background:var(--series-up)"></i>Upload from users</span>
+            </div>
+          </div>
+          <div id="chart" class="chart"></div>
+        </div>
+        <div class="glass panel">
+          <div class="panel-head"><h2>Server health</h2></div>
+          <div id="health"></div>
+        </div>
+      </div>
+      <div class="glass panel">
+        <div class="panel-head">
+          <h2>Connected right now</h2>
+          <button class="btn quiet" data-goto="users">Manage users</button>
+        </div>
+        <div id="live"></div>
+      </div>
+    </section>
+
+    <!-- Users -->
+    <section id="tab-users" class="view" hidden>
+      <div class="toolbar">
+        <div>
+          <h1>Users</h1>
+          <p class="muted" id="users-summary"></p>
+        </div>
+        <div class="toolbar-actions">
+          <input id="search" type="search" placeholder="Search by name or email" aria-label="Search users">
+          <a class="btn" href="/api/guide">Download user guide (PDF)</a>
+          <button class="btn primary admin-only" id="add-user">Add user</button>
+        </div>
+      </div>
+      <div class="glass panel flush">
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>User</th><th>Status</th><th>Likely device</th><th>VPN address</th><th>Connecting from</th><th>Last seen</th>
+              <th class="num">Downloaded</th><th class="num">Uploaded</th><th class="num">Speed now</th><th></th>
+            </tr></thead>
+            <tbody id="users-body"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="users-pager" hidden></div>
+        <p id="users-empty" class="empty" hidden></p>
+      </div>
+      <p class="muted small">Downloaded and uploaded totals count from the last time the VPN service started.</p>
+    </section>
+
+    <!-- Usage -->
+    <section id="tab-usage" class="view" hidden>
+      <div class="toolbar">
+        <div>
+          <h1>Usage</h1>
+          <p class="muted" id="usage-summary"></p>
+        </div>
+        <div class="toolbar-actions">
+          <select id="usage-user" aria-label="Show usage for"></select>
+          <div class="seg" id="usage-seg" role="group" aria-label="Period">
+            <button data-range="24h">24 hours</button>
+            <button data-range="7d">7 days</button>
+            <button data-range="30d">30 days</button>
+            <button data-range="90d">90 days</button>
+            <button data-range="365d">1 year</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="glass panel">
+        <div class="panel-head">
+          <div><h2 id="usage-chart-title">Data used</h2><p class="muted" id="usage-chart-sub"></p></div>
+          <div class="legend" aria-label="Legend">
+            <span><i class="swatch block" style="background:var(--series-down)"></i>Downloaded</span>
+            <span><i class="swatch block" style="background:var(--series-up)"></i>Uploaded</span>
+          </div>
+        </div>
+        <div id="usage-chart" class="chart"></div>
+      </div>
+
+      <div class="glass panel flush">
+        <div class="panel-head inset">
+          <div><h2>By user</h2><p class="muted">Select a row to see only that user above and below</p></div>
+          <a class="btn" id="export-users">Export as CSV</a>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>User</th><th class="num">Downloaded</th><th class="num">Uploaded</th><th class="num">Total</th>
+              <th style="width:22%">Share of all traffic</th><th class="num">Connections</th>
+              <th class="num">Time connected</th><th>Last connected</th>
+            </tr></thead>
+            <tbody id="usage-users"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="usage-users-pager" hidden></div>
+        <p id="usage-users-empty" class="empty" hidden></p>
+      </div>
+
+      <div class="glass panel flush">
+        <div class="panel-head inset">
+          <div><h2>Connection log</h2><p class="muted" id="conn-sub"></p></div>
+          <div class="toolbar-actions">
+            <a class="btn" id="export-history">Export history as CSV</a>
+            <a class="btn" id="export-connections">Export log as CSV</a>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>User</th><th>Connected from</th><th>Location</th><th>Started</th><th>Ended</th><th class="num">Duration</th>
+              <th class="num">Downloaded</th><th class="num">Uploaded</th>
+            </tr></thead>
+            <tbody id="usage-conns"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="usage-conns-pager" hidden></div>
+        <p id="usage-conns-empty" class="empty" hidden></p>
+      </div>
+      <p class="muted small" id="usage-note"></p>
+    </section>
+
+    <!-- Websites -->
+    <section id="tab-websites" class="view" hidden>
+      <div class="toolbar">
+        <div>
+          <h1>Websites</h1>
+          <p class="muted" id="sites-summary"></p>
+        </div>
+        <div class="toolbar-actions">
+          <input id="sites-search" type="search" placeholder="Search sites" aria-label="Search sites">
+          <select id="sites-user" aria-label="Show websites for"></select>
+          <div class="seg" id="sites-seg" role="group" aria-label="Period">
+            <button data-range="24h">24 hours</button>
+            <button data-range="7d">7 days</button>
+            <button data-range="30d">30 days</button>
+            <button data-range="90d">90 days</button>
+          </div>
+          <a class="btn" id="export-sites">Export as CSV</a>
+        </div>
+      </div>
+      <div class="glass panel" id="block-panel">
+        <div class="panel-head">
+          <div><h2>Blocking</h2><p class="muted" id="block-sub">Loading</p></div>
+          <button class="btn" id="block-toggle" hidden></button>
+        </div>
+        <div id="block-body"></div>
+      </div>
+      <div class="glass panel flush">
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Site</th><th>Looked up by</th><th class="num">Lookups</th><th>First seen</th><th>Last seen</th><th></th>
+            </tr></thead>
+            <tbody id="sites-body"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="sites-pager" hidden></div>
+        <p id="sites-empty" class="empty" hidden></p>
+      </div>
+      <p class="muted small" id="sites-note"></p>
+    </section>
+
+    <!-- Server -->
+    <section id="tab-server" class="view" hidden>
+      <div class="toolbar"><div><h1>Server</h1><p class="muted" id="server-summary"></p></div></div>
+      <div class="split even">
+        <div class="stack">
+          <div class="glass panel">
+            <div class="panel-head"><h2>Controls</h2></div>
+            <div id="controls" class="controls"></div>
+          </div>
+          <div class="glass panel">
+            <div class="panel-head"><h2>Details</h2></div>
+            <dl id="details" class="details"></dl>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="glass panel">
+            <div class="panel-head">
+              <div><h2>Backups</h2><p class="muted" id="backups-sub">Server keys, every user and the recorded history</p></div>
+              <button class="btn admin-only" id="make-backup">Create backup</button>
+            </div>
+            <div id="backups"></div>
+            <div class="pager side" id="backups-pager" hidden></div>
+          </div>
+          <div class="glass panel">
+            <div class="panel-head">
+              <div><h2>History</h2><p class="muted" id="history-sub">Recorded once a minute on the server</p></div>
+              <div class="seg" id="history-seg" role="group" aria-label="Period">
+                <button data-range="24h">24 hours</button>
+                <button data-range="7d">7 days</button>
+                <button data-range="30d">30 days</button>
+              </div>
+            </div>
+            <div class="mini">
+              <div class="mini-head"><b>Traffic</b>
+                <span class="legend">
+                  <span><i class="swatch" style="background:var(--series-down)"></i>Sent by the server</span>
+                  <span><i class="swatch" style="background:var(--series-up)"></i>Received</span>
+                </span>
+              </div>
+              <div class="chart small" id="h-traffic"></div>
+            </div>
+            <div class="mini"><div class="mini-head"><b>Connected users</b></div><div class="chart small" id="h-online"></div></div>
+            <div class="mini"><div class="mini-head"><b>Processor</b></div><div class="chart small" id="h-cpu"></div></div>
+            <div class="mini"><div class="mini-head"><b>Memory</b></div><div class="chart small" id="h-mem"></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Activity -->
+    <section id="tab-activity" class="view" hidden>
+      <div class="toolbar"><div><h1>Activity</h1><p class="muted" id="activity-sub">What has been done through this portal, newest first</p></div>
+        <div class="toolbar-actions"><a class="btn" href="/api/activity/export">Export as CSV</a></div></div>
+      <div class="glass panel flush">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>When</th><th>Account</th><th>Action</th><th>Details</th><th>From</th></tr></thead>
+            <tbody id="activity-body"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="activity-pager" hidden></div>
+        <p id="activity-empty" class="empty" hidden>Nothing has been done through the portal yet.</p>
+      </div>
+    </section>
+
+    <!-- Administration -->
+    <section id="tab-admin" class="view" hidden>
+      <div class="toolbar"><div><h1>Administration</h1><p class="muted">Who can sign in to this portal, how long records are kept, and where alerts go</p></div></div>
+
+      <div class="glass panel flush">
+        <div class="panel-head inset">
+          <div><h2>Portal accounts</h2><p class="muted">People who can sign in here. These are separate from VPN users. An administrator can change everything; a viewer can look but not change anything or download profiles and backups.</p></div>
+          <button class="btn primary" id="add-account">Add account</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Account</th><th>Role</th><th>Status</th><th>Last signed in</th><th>Created</th><th></th></tr></thead>
+            <tbody id="accounts-body"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="accounts-pager" hidden></div>
+      </div>
+
+      <div class="glass panel flush" id="lists-panel">
+        <div class="panel-head inset">
+          <div><h2>Website block lists</h2><p class="muted" id="lists-sub">Loading</p></div>
+          <button class="btn primary" id="add-list">Add a list</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>List</th><th class="num">Sites</th><th>Last downloaded</th><th>Used for blocking</th><th></th></tr></thead>
+            <tbody id="lists-body"></tbody>
+          </table>
+        </div>
+        <div class="allow">
+          <h3>Never blocked</h3>
+          <p class="muted">Sites here stay reachable even when a list includes them. Each covers everything under it, so example.com includes www.example.com.</p>
+          <form class="block-add" id="allow-form">
+            <input id="allow-input" placeholder="example.com" aria-label="Site to never block" autocomplete="off">
+            <button class="btn" type="submit">Never block</button>
+          </form>
+          <div class="chips" id="allow-chips"></div>
+        </div>
+      </div>
+
+      <div class="split even">
+        <div class="glass panel">
+          <div class="panel-head"><div><h2>Settings</h2><p class="muted">Anything older than these limits is deleted automatically</p></div></div>
+          <form id="settings-form" class="form">
+            <h3>Records kept</h3>
+            <div class="form-grid">
+              <div><label for="set-usage_days">Usage and connection log</label><div class="unit"><input id="set-usage_days" type="number" required><span>days</span></div></div>
+              <div><label for="set-site_days">Website log</label><div class="unit"><input id="set-site_days" type="number" required><span>days</span></div></div>
+              <div><label for="set-log_days">Portal activity log</label><div class="unit"><input id="set-log_days" type="number" required><span>days</span></div></div>
+            </div>
+            <h3>Backups</h3>
+            <div class="form-grid">
+              <div><label for="set-backup_hour">Nightly backup runs after</label><div class="unit"><input id="set-backup_hour" type="number" required><span>:00</span></div></div>
+              <div><label for="set-backup_keep_days">Backups kept</label><div class="unit"><input id="set-backup_keep_days" type="number" required><span>days</span></div></div>
+            </div>
+            <h3>Sign-in</h3>
+            <div class="form-grid">
+              <div><label for="set-session_hours">Stay signed in for</label><div class="unit"><input id="set-session_hours" type="number" required><span>hours</span></div></div>
+            </div>
+            <p class="hint" id="settings-note"></p>
+            <div class="form-actions"><button class="btn primary" type="submit">Save settings</button></div>
+          </form>
+        </div>
+
+        <div class="glass panel">
+          <div class="panel-head"><div><h2>Alerts and reports</h2><p class="muted" id="alerts-sub">Loading</p></div></div>
+          <form id="alerts-form" class="form" autocomplete="off">
+            <h3>Send by email</h3>
+            <div class="form-grid">
+              <div><label for="al-host">Mail server</label><input id="al-host" placeholder="smtp.example.com"></div>
+              <div class="pair">
+                <div><label for="al-port">Port</label><input id="al-port" type="number" min="1" max="65535"></div>
+                <div><label for="al-security">Security</label><select id="al-security"><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">None</option></select></div>
+              </div>
+              <div><label for="al-user">Mail account username</label><input id="al-user" autocomplete="off"></div>
+              <div><label for="al-password">Mail account password</label><input id="al-password" type="password" autocomplete="new-password"></div>
+              <div><label for="al-sender">Send from</label><input id="al-sender" placeholder="vpn@example.com"></div>
+              <div><label for="al-to">Send to</label><input id="al-to" placeholder="you@example.com, other@example.com"></div>
+            </div>
+            <h3>Send to a chat channel</h3>
+            <label for="al-webhook">Webhook link</label>
+            <input id="al-webhook" placeholder="https://hooks.slack.com/services/...">
+            <p class="hint">An incoming-webhook link from Slack, Microsoft Teams or Discord.</p>
+            <h3>Alert when</h3>
+            <div id="al-events"></div>
+            <h3>Scheduled report</h3>
+            <select id="al-report" aria-label="Scheduled report">
+              <option value="off">No report</option>
+              <option value="daily">Every day at 08:00</option>
+              <option value="weekly">Every Monday at 08:00</option>
+            </select>
+            <p class="hint">A summary of each user's data use and connections, and any connection from a new country or provider.</p>
+            <label class="check" style="margin-top:16px"><input type="checkbox" id="al-enabled"><div>Alerts and reports are on<span>Leave this off until the details above are filled in and a test message has arrived.</span></div></label>
+            <p id="alerts-error" class="error" role="alert"></p>
+            <div class="form-actions">
+              <button class="btn" type="button" id="alerts-test">Send a test message</button>
+              <button class="btn primary" type="submit">Save alerts</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Dialogs -->
+<dialog id="dlg-add" class="glass dialog">
+  <form id="add-form" method="dialog">
+    <h2>Add user</h2>
+    <label for="new-name">Name</label>
+    <input id="new-name" required maxlength="15" pattern="[a-z0-9_\-]{1,15}" placeholder="alice" autocomplete="off">
+    <p class="hint">Lowercase letters, digits, - or _. Up to 15 characters. This becomes the profile's file name.</p>
+    <label for="new-email">Email (optional)</label>
+    <input id="new-email" type="email" placeholder="alice@example.com" autocomplete="off">
+    <p class="hint">Kept in users.txt for your records. Nothing is emailed.</p>
+    <p id="add-error" class="error" role="alert"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="submit" class="btn primary" id="add-submit">Add user</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-account" class="glass dialog">
+  <form id="account-form" method="dialog" autocomplete="off">
+    <h2 id="account-title"></h2>
+    <label for="acc-username">Username</label>
+    <input id="acc-username" required maxlength="32" autocapitalize="none" spellcheck="false" autocomplete="off">
+    <label for="acc-name">Full name (optional)</label>
+    <input id="acc-name" maxlength="60" autocomplete="off">
+    <label for="acc-role">Role</label>
+    <select id="acc-role" style="width:100%">
+      <option value="admin">Administrator: can change everything</option>
+      <option value="viewer">Viewer: can look, cannot change anything</option>
+    </select>
+    <label for="acc-password" id="acc-password-label">Password</label>
+    <input id="acc-password" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+    <p class="hint" id="acc-password-hint"></p>
+    <p id="account-error" class="error" role="alert"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="submit" class="btn primary" id="account-submit"></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-list" class="glass dialog wide">
+  <h2 id="list-title"></h2>
+  <p class="muted" id="list-sub"></p>
+  <input id="list-search" type="search" placeholder="Search this list" aria-label="Search this list" style="margin-top:14px">
+  <div id="list-rows" class="list-rows"></div>
+  <div class="pager side" id="list-pager"></div>
+  <div class="dialog-actions"><button type="button" class="btn" data-close>Close</button></div>
+</dialog>
+
+<dialog id="dlg-newlist" class="glass dialog">
+  <form id="newlist-form" method="dialog" autocomplete="off">
+    <h2>Add a block list</h2>
+    <p class="muted">A link to a published list of site names: a hosts file, or one name per line.</p>
+    <label for="nl-label">Name</label>
+    <input id="nl-label" required maxlength="60" placeholder="Streaming sites">
+    <label for="nl-url">Link to the list</label>
+    <input id="nl-url" required type="url" maxlength="500" placeholder="https://example.com/list.txt">
+    <p class="hint">The server downloads it now to check it, then again every day while it is in use. It is not used for blocking until you choose to.</p>
+    <p id="newlist-error" class="error" role="alert"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="submit" class="btn primary" id="newlist-submit">Add list</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-me" class="glass dialog">
+  <form id="me-form" method="dialog">
+    <h2>Your account</h2>
+    <p class="muted" id="me-who"></p>
+    <label for="me-current">Current password</label>
+    <input id="me-current" type="password" autocomplete="current-password" required>
+    <label for="me-new">New password</label>
+    <input id="me-new" type="password" autocomplete="new-password" required minlength="10" maxlength="200">
+    <p class="hint">At least 10 characters. Other browsers signed in with this account are signed out.</p>
+    <p id="me-error" class="error" role="alert"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="submit" class="btn primary">Change password</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-qr" class="glass dialog">
+  <h2 id="qr-title"></h2>
+  <p class="muted">Scan with the WireGuard app on a phone, or download the file for a computer. Anyone holding this code can connect as this user.</p>
+  <div class="qr-box"><img id="qr-img" alt="QR code for the profile" width="260" height="260"></div>
+  <div class="dialog-actions">
+    <button type="button" class="btn" data-close>Close</button>
+    <a class="btn primary" id="qr-download">Download profile</a>
+  </div>
+</dialog>
+
+<dialog id="dlg-confirm" class="glass dialog">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-text" class="muted"></p>
+  <div class="dialog-actions">
+    <button type="button" class="btn" data-close>Cancel</button>
+    <button type="button" class="btn primary" id="confirm-ok"></button>
+  </div>
+</dialog>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

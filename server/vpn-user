@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Runs ON THE SERVER as root (installed to /usr/local/sbin/vpn-user by ./setup.sh).
+# Manages WireGuard peers without dropping existing connections.
+#
+#   vpn-user add <name>      create a user (use show to get the profile)
+#   vpn-user remove <name>   revoke a user permanently
+#   vpn-user disable <name>  suspend a user (profile is kept, cannot connect)
+#   vpn-user enable <name>   resume a suspended user
+#   vpn-user show <name>     print the client .conf
+#   vpn-user qr <name>       QR code in the terminal
+#   vpn-user qr-png <name>   QR code as PNG on stdout
+#   vpn-user list            name, VPN IP, last handshake, traffic
+#   vpn-user exists <name>   exit 0 if the user exists
+
+set -euo pipefail
+umask 077
+source /etc/wireguard/vpn.env
+
+WG_CONF=/etc/wireguard/wg0.conf
+CLIENTS=/etc/wireguard/clients
+DISABLED=/etc/wireguard/disabled
+mkdir -p "$CLIENTS" "$DISABLED"
+
+die() { echo "vpn-user: $*" >&2; exit 1; }
+
+check_name() {
+  [[ "${1:-}" =~ ^[a-z0-9_-]{1,15}$ ]] || die "invalid name '${1:-}' (use a-z 0-9 _ -, max 15 chars)"
+}
+
+must_exist() { [[ -f "$CLIENTS/$1.conf" ]] || die "no such user '$1'"; }
+
+lock() { exec 9>/run/vpn-user.lock; flock 9; }
+
+apply() {
+  if systemctl is-active -q wg-quick@wg0; then
+    wg syncconf wg0 <(wg-quick strip wg0)
+  fi
+}
+
+# Remove a user's peer block from wg0.conf and tidy the blank lines left behind.
+drop_block() {
+  cp "$WG_CONF" "$WG_CONF.bak"
+  sed -i "/^# BEGIN $1\$/,/^# END $1\$/d" "$WG_CONF"
+  sed -i -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' "$WG_CONF"
+}
+
+next_octet() {
+  local used i
+  used="$(grep -ohE "^Address = $WG_NET\.[0-9]+" "$CLIENTS"/*.conf 2>/dev/null | awk -F. '{print $NF}' || true)"
+  for i in $(seq 2 254); do
+    grep -qx "$i" <<<"$used" || { echo "$i"; return; }
+  done
+  die "VPN subnet is full"
+}
+
+cmd="${1:-}"; name="${2:-}"
+
+case "$cmd" in
+  add)
+    check_name "$name"
+    [[ -f "$CLIENTS/$name.conf" ]] && die "user '$name' already exists"
+    lock
+    octet="$(next_octet)"
+    priv="$(wg genkey)"; pub="$(wg pubkey <<<"$priv")"; psk="$(wg genpsk)"
+    server_pub="$(grep -m1 '^PrivateKey' "$WG_CONF" | awk '{print $3}' | wg pubkey)"
+
+    cat > "$CLIENTS/$name.conf" <<EOF
+[Interface]
+PrivateKey = $priv
+Address = $WG_NET.$octet/32, $WG_NET6::$octet/128
+DNS = $CLIENT_DNS
+
+[Peer]
+PublicKey = $server_pub
+PresharedKey = $psk
+Endpoint = $SERVER_IP:${CLIENT_PORT:-$WG_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+
+    cat >> "$WG_CONF" <<EOF
+
+# BEGIN $name
+[Peer]
+PublicKey = $pub
+PresharedKey = $psk
+AllowedIPs = $WG_NET.$octet/32, $WG_NET6::$octet/128
+# END $name
+EOF
+    apply
+    echo "added $name ($WG_NET.$octet)" >&2
+    ;;
+
+  remove)
+    check_name "$name"; must_exist "$name"
+    lock
+    drop_block "$name"
+    rm -f "$CLIENTS/$name.conf" "$DISABLED/$name.peer"
+    apply
+    echo "removed $name" >&2
+    ;;
+
+  disable)
+    check_name "$name"; must_exist "$name"
+    [[ -f "$DISABLED/$name.peer" ]] && die "user '$name' is already suspended"
+    lock
+    sed -n "/^# BEGIN $name\$/,/^# END $name\$/p" "$WG_CONF" > "$DISABLED/$name.peer"
+    [[ -s "$DISABLED/$name.peer" ]] || { rm -f "$DISABLED/$name.peer"; die "could not find peer entry for '$name'"; }
+    drop_block "$name"
+    apply
+    echo "suspended $name" >&2
+    ;;
+
+  enable)
+    check_name "$name"; must_exist "$name"
+    [[ -f "$DISABLED/$name.peer" ]] || die "user '$name' is not suspended"
+    lock
+    { echo; cat "$DISABLED/$name.peer"; } >> "$WG_CONF"
+    rm -f "$DISABLED/$name.peer"
+    apply
+    echo "resumed $name" >&2
+    ;;
+
+  show)
+    check_name "$name"; must_exist "$name"
+    cat "$CLIENTS/$name.conf"
+    ;;
+
+  qr)
+    check_name "$name"; must_exist "$name"
+    qrencode -t ansiutf8 < "$CLIENTS/$name.conf"
+    ;;
+
+  qr-png)
+    check_name "$name"; must_exist "$name"
+    qrencode -t png -s 6 -o - < "$CLIENTS/$name.conf"
+    ;;
+
+  exists)
+    check_name "$name"
+    [[ -f "$CLIENTS/$name.conf" ]]
+    ;;
+
+  list)
+    now="$(date +%s)"
+    dump="$(wg show wg0 dump 2>/dev/null | tail -n +2 || true)"
+    printf '%-16s %-12s %-22s %-12s %-12s\n' USER VPN-IP LAST-SEEN DOWNLOADED UPLOADED
+    shopt -s nullglob
+    for f in "$CLIENTS"/*.conf; do
+      n="$(basename "$f" .conf)"
+      ip="$(grep -m1 '^Address' "$f" | awk '{print $3}' | cut -d/ -f1)"
+      pub="$(grep -m1 '^PrivateKey' "$f" | awk '{print $3}' | wg pubkey)"
+      line="$(awk -v k="$pub" '$1==k' <<<"$dump")"
+      hs="$(awk '{print $5}' <<<"$line")"; rx="$(awk '{print $6}' <<<"$line")"; tx="$(awk '{print $7}' <<<"$line")"
+      if [[ -f "$DISABLED/$n.peer" ]]; then seen="suspended"
+      elif [[ -z "$hs" || "$hs" == 0 ]]; then seen="never"
+      else
+        age=$((now - hs))
+        if   ((age < 180));   then seen="connected"
+        elif ((age < 3600));  then seen="$((age/60)) min ago"
+        elif ((age < 86400)); then seen="$((age/3600)) h ago"
+        else seen="$((age/86400)) d ago"; fi
+      fi
+      # server "tx" is what the user downloaded
+      printf '%-16s %-12s %-22s %-12s %-12s\n' "$n" "$ip" "$seen" \
+        "$(numfmt --to=iec --suffix=B "${tx:-0}")" "$(numfmt --to=iec --suffix=B "${rx:-0}")"
+    done
+    ;;
+
+  *)
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

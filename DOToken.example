@@ -1,0 +1,5 @@
+Paste your DigitalOcean API token on a single line in a file named exactly "DOToken"
+(no extension) in the project root, then delete this example file's guidance.
+
+Create a token at: https://cloud.digitalocean.com/account/api/tokens
+It needs read + write scope. The real "DOToken" file is git-ignored and never committed.

@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Runs ON THE SERVER as root (installed to /usr/local/sbin/vpn-usage).
+
+Keeps a record of how much data each VPN user moves, when they were connected,
+and (when LOG_WEBSITES is on) the domain names their devices looked up.
+Domain names only: never page addresses, page content or anything typed.
+
+  vpn-usage collect                      take one reading (run every minute by a systemd timer)
+  vpn-usage report --since TS --bucket S --offset S
+                                         JSON for the web portal
+  vpn-usage sites --since TS             JSON website log for the web portal
+  vpn-usage health --since TS --bucket S JSON server health history for the web portal
+  vpn-usage top [--days N]               quick per-user totals in the terminal
+
+The database is /etc/wireguard/usage.db, so ./backup.sh includes it.
+"""
+import argparse
+import calendar
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+DB = "/etc/wireguard/usage.db"
+WG_CONF = "/etc/wireguard/wg0.conf"
+BUCKET = 300          # usage is stored in 5-minute slices
+ACTIVE_WITHIN = 150   # seconds since the last handshake that still counts as connected
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage (
+  bucket INTEGER NOT NULL, name TEXT NOT NULL,
+  down INTEGER NOT NULL DEFAULT 0, up INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket, name));
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL,
+  started INTEGER NOT NULL, ended INTEGER NOT NULL,
+  down INTEGER NOT NULL DEFAULT 0, up INTEGER NOT NULL DEFAULT 0, open INTEGER NOT NULL DEFAULT 1);
+CREATE INDEX IF NOT EXISTS sessions_ended ON sessions (ended);
+CREATE TABLE IF NOT EXISTS peers (
+  pubkey TEXT PRIMARY KEY, name TEXT NOT NULL, rx INTEGER NOT NULL, tx INTEGER NOT NULL,
+  last_active INTEGER NOT NULL DEFAULT 0, session INTEGER);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sites (
+  bucket INTEGER NOT NULL, name TEXT NOT NULL, domain TEXT NOT NULL, site TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 0, first INTEGER NOT NULL, last INTEGER NOT NULL,
+  PRIMARY KEY (bucket, name, domain));
+CREATE INDEX IF NOT EXISTS sites_site ON sites (site);
+CREATE TABLE IF NOT EXISTS health (
+  ts INTEGER PRIMARY KEY, cpu REAL, mem REAL, disk REAL, load REAL,
+  rx INTEGER, tx INTEGER, online INTEGER);
+"""
+
+
+def connect():
+    db = sqlite3.connect(DB, timeout=30)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    if "blocked" not in [r[1] for r in db.execute("PRAGMA table_info(sites)")]:
+        db.execute("ALTER TABLE sites ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
+    return db
+
+
+def setting(key, default):
+    try:
+        m = re.search(rf'^{key}="?([^"\n]*)', open("/etc/wireguard/vpn.env").read(), re.M)
+        return m.group(1) if m else default
+    except OSError:
+        return default
+
+
+def retention_days():
+    return int(setting("USAGE_RETENTION_DAYS", "30") or 30)
+
+
+def site_retention_days():
+    return int(setting("SITE_RETENTION_DAYS", "30") or 30)
+
+
+DNS_LOG = "/var/log/vpn-dns.log"
+SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac", "edu", "gc", "on", "qc", "bc", "ab", "or", "ne", "go", "mil"}
+BLOCKED = re.compile(r": (?:config|/etc/vpn-block/\S+) (\S+) is (?:0\.0\.0\.0|::)$")
+QUERY = re.compile(r"^(\w{3})\s+(\d+) (\d+):(\d+):(\d+) dnsmasq\[\d+\]: query\[(A|AAAA|HTTPS)\] (\S+) from (\S+)$")
+MONTHS = {m: i for i, m in enumerate(calendar.month_abbr) if m}
+
+
+def site_of(domain):
+    """The registrable part of a host name: mail.google.com -> google.com, www.bbc.co.uk -> bbc.co.uk."""
+    parts = domain.split(".")
+    if len(parts) <= 2:
+        return domain
+    if len(parts[-1]) == 2 and parts[-2] in SECOND_LEVEL:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def collect_sites(db, now):
+    """Fold the resolver's query log into per-user, per-domain, per-hour counts."""
+    if setting("LOG_WEBSITES", "no") != "yes":
+        return
+    if not os.path.exists(DNS_LOG):
+        # The resolver cannot create its own log file, so put one back and tell it to reopen.
+        open(DNS_LOG, "a").close()
+        os.chmod(DNS_LOG, 0o600)
+        subprocess.run(["chown", "dnsmasq", DNS_LOG])
+        subprocess.run(["pkill", "-USR2", "-x", "dnsmasq"])
+        return
+    # Take what has been written so far and empty the file in place. The resolver appends,
+    # so it carries on at the start of the emptied file.
+    with open(DNS_LOG, "r+", errors="replace") as f:
+        lines = f.readlines()
+        f.truncate(0)
+    if not lines:
+        return
+    who = {}
+    for path in glob.glob("/etc/wireguard/clients/*.conf"):
+        m = re.search(r"^Address = ([0-9.]+)", open(path).read(), re.M)
+        if m:
+            who[m.group(1)] = os.path.basename(path)[:-5]
+    year = time.gmtime(now).tm_year
+    seen = {}   # (hour, user, domain) -> {type: count, first, last}
+    asked = {}  # domain -> the entry of whoever asked for it most recently
+    for line in lines:
+        if True:
+            line = line.rstrip()
+            b = BLOCKED.search(line)
+            if b:   # the answer to the lookup just before it: this name is on a block list
+                e = asked.get(b.group(1).lower())
+                if e:
+                    e["blocked"] = True
+                continue
+            m = QUERY.match(line)
+            if not m or m.group(8) not in who:
+                continue
+            domain = m.group(7).lower().rstrip(".")
+            if "." not in domain or domain.endswith((".arpa", ".local", ".lan", ".internal")):
+                continue
+            ts = calendar.timegm((year, MONTHS.get(m.group(1), 1), int(m.group(2)),
+                                  int(m.group(3)), int(m.group(4)), int(m.group(5))))
+            if ts > now + 86400:               # log line from late December read in January
+                ts = calendar.timegm((year - 1,) + time.gmtime(ts)[1:6])
+            e = seen.setdefault((ts // 3600 * 3600, who[m.group(8)], domain), {"first": ts, "last": ts})
+            e[m.group(6)] = e.get(m.group(6), 0) + 1
+            asked[domain] = e
+            e["first"], e["last"] = min(e["first"], ts), max(e["last"], ts)
+    for (bucket, name, domain), e in seen.items():
+        # A device asks for the same name several ways at once; count that as one lookup.
+        hits = max(e.get("A", 0), e.get("AAAA", 0), e.get("HTTPS", 0))
+        db.execute("INSERT INTO sites VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(bucket,name,domain) DO UPDATE SET "
+                   "hits=hits+excluded.hits, first=MIN(first, excluded.first), last=MAX(last, excluded.last), "
+                   "blocked=blocked+excluded.blocked",
+                   (bucket, name, domain, site_of(domain), hits, e["first"], e["last"], hits if e.get("blocked") else 0))
+    db.execute("INSERT INTO meta VALUES ('sites_since', ?) ON CONFLICT(key) DO NOTHING", (str(now),))
+    db.commit()
+
+
+def sites_report(since):
+    db = connect()
+    rows = db.execute("SELECT name, site, domain, SUM(hits) AS hits, MIN(first) AS first, MAX(last) AS last, SUM(blocked) AS blocked "
+                      "FROM sites WHERE bucket >= ? GROUP BY name, domain ORDER BY hits DESC LIMIT 30000",
+                      (since // 3600 * 3600,)).fetchall()
+    meta = db.execute("SELECT value FROM meta WHERE key='sites_since'").fetchone()
+    print(json.dumps({
+        "now": int(time.time()), "since": since,
+        "enabled": setting("LOG_WEBSITES", "no") == "yes",
+        "recording_since": int(meta["value"]) if meta else None,
+        "retention_days": site_retention_days(),
+        "rows": [[r["name"], r["site"], r["domain"], r["hits"], r["first"], r["last"], r["blocked"]] for r in rows],
+    }))
+
+
+def names_by_key():
+    try:
+        text = open(WG_CONF).read()
+    except OSError:
+        return {}
+    out = {}
+    for name, body in re.findall(r"^# BEGIN (\S+)\n(.*?)^# END \1$", text, re.M | re.S):
+        m = re.search(r"^PublicKey = (\S+)", body, re.M)
+        if m:
+            out[m.group(1)] = name
+    return out
+
+
+def collect():
+    now = int(time.time())
+    db = connect()
+    first_run = db.execute("SELECT value FROM meta WHERE key='since'").fetchone() is None
+    if first_run:
+        db.execute("INSERT INTO meta VALUES ('since', ?)", (str(now),))
+
+    names = names_by_key()
+    dump = subprocess.run(["wg", "show", "wg0", "dump"], capture_output=True, text=True).stdout
+    seen = set()
+    online = 0
+    for line in dump.splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) < 7 or f[0] not in names:
+            continue
+        key, name = f[0], names[f[0]]
+        source = "" if f[2] == "(none)" else f[2].rsplit(":", 1)[0].strip("[]")
+        handshake, rx, tx = int(f[4]), int(f[5]), int(f[6])
+        seen.add(key)
+
+        prev = db.execute("SELECT * FROM peers WHERE pubkey=?", (key,)).fetchone()
+        if prev:   # counters restart from zero whenever WireGuard restarts
+            d_rx = rx - prev["rx"] if rx >= prev["rx"] else rx
+            d_tx = tx - prev["tx"] if tx >= prev["tx"] else tx
+        else:      # the very first reading has no starting point to measure from
+            d_rx, d_tx = (0, 0) if first_run else (rx, tx)
+
+        if d_rx or d_tx:   # the server's "tx" is what the user downloaded
+            db.execute("INSERT INTO usage VALUES (?,?,?,?) ON CONFLICT(bucket,name) "
+                       "DO UPDATE SET down=down+excluded.down, up=up+excluded.up",
+                       (now // BUCKET * BUCKET, name, d_tx, d_rx))
+
+        session = prev["session"] if prev else None
+        last_active = prev["last_active"] if prev else 0
+        active = bool(source) and (d_rx > 0 or (handshake and now - handshake < ACTIVE_WITHIN))
+        if active:
+            if session:
+                row = db.execute("SELECT source FROM sessions WHERE id=?", (session,)).fetchone()
+                if not row or row["source"] != source:   # moved networks: log it as a new connection
+                    db.execute("UPDATE sessions SET open=0 WHERE id=?", (session,))
+                    session = None
+            if not session:
+                started = handshake if handshake and now - handshake <= 90 else now
+                session = db.execute("INSERT INTO sessions (name, source, started, ended) VALUES (?,?,?,?)",
+                                     (name, source, started, now)).lastrowid
+            db.execute("UPDATE sessions SET ended=?, down=down+?, up=up+? WHERE id=?", (now, d_tx, d_rx, session))
+            last_active = now
+            online += 1
+        elif session:
+            db.execute("UPDATE sessions SET open=0 WHERE id=?", (session,))
+            session = None
+
+        db.execute("INSERT INTO peers VALUES (?,?,?,?,?,?) ON CONFLICT(pubkey) DO UPDATE SET "
+                   "name=excluded.name, rx=excluded.rx, tx=excluded.tx, "
+                   "last_active=excluded.last_active, session=excluded.session",
+                   (key, name, rx, tx, last_active, session))
+
+    # Users who were removed or suspended, or everyone when the VPN is stopped.
+    for row in db.execute("SELECT pubkey, session FROM peers").fetchall():
+        if row["pubkey"] not in seen:
+            if row["session"]:
+                db.execute("UPDATE sessions SET open=0 WHERE id=?", (row["session"],))
+            db.execute("UPDATE peers SET session=NULL, rx=0, tx=0 WHERE pubkey=?", (row["pubkey"],))
+
+    cutoff = now - retention_days() * 86400
+    db.execute("DELETE FROM usage WHERE bucket < ?", (cutoff,))
+    db.execute("DELETE FROM sessions WHERE ended < ?", (cutoff,))
+    db.execute("DELETE FROM sites WHERE bucket < ?", (now - site_retention_days() * 86400,))
+    db.execute("DELETE FROM health WHERE ts < ?", (cutoff,))
+    record_health(db, now, online)
+    db.commit()
+    collect_sites(db, now)
+
+
+def record_health(db, now, online):
+    """One row a minute: processor, memory, disk, load, traffic and connected users."""
+    def meta(key, value=None):
+        if value is None:
+            r = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return r["value"] if r else None
+        db.execute("INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    cpu = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+    total, idle = sum(cpu), cpu[3] + cpu[4]
+    mem = dict(re.findall(r"^(\w+):\s+(\d+)", open("/proc/meminfo").read(), re.M))
+    st = os.statvfs("/")
+    route = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True).stdout
+    wan = (route.split("dev ")[1:] or ["eth0"])[0].split()[0]
+    rx = int(open(f"/sys/class/net/{wan}/statistics/rx_bytes").read())
+    tx = int(open(f"/sys/class/net/{wan}/statistics/tx_bytes").read())
+
+    prev = meta("health_prev")
+    cpu_pct = d_rx = d_tx = None
+    if prev:
+        p_total, p_idle, p_rx, p_tx = (int(x) for x in prev.split())
+        if total > p_total:
+            cpu_pct = round(100 * (1 - (idle - p_idle) / (total - p_total)), 1)
+        d_rx, d_tx = (rx - p_rx if rx >= p_rx else rx), (tx - p_tx if tx >= p_tx else tx)   # counters reset on reboot
+    meta("health_prev", f"{total} {idle} {rx} {tx}")
+    db.execute("INSERT OR REPLACE INTO health VALUES (?,?,?,?,?,?,?,?)",
+               (now // 60 * 60, cpu_pct,
+                round(100 * (1 - int(mem["MemAvailable"]) / int(mem["MemTotal"])), 1),
+                round(100 * (1 - st.f_bavail / st.f_blocks), 1),
+                float(open("/proc/loadavg").read().split()[0]), d_rx, d_tx, online))
+
+
+def health_report(since, bucket):
+    db = connect()
+    rows = db.execute(
+        "SELECT (ts / ?) * ? AS b, AVG(cpu), AVG(mem), MAX(disk), AVG(load), SUM(rx), SUM(tx), MAX(online), COUNT(*) "
+        "FROM health WHERE ts >= ? GROUP BY b ORDER BY b", (bucket, bucket, since)).fetchall()
+    print(json.dumps({"now": int(time.time()), "since": since, "bucket": bucket, "retention_days": retention_days(),
+                      "rows": [[r[0]] + [None if v is None else round(v, 1) for v in r[1:5]] + [r[5], r[6], r[7], r[8]]
+                               for r in rows]}))
+
+
+def report(since, bucket, offset):
+    now = int(time.time())
+    db = connect()
+    series = db.execute(
+        "SELECT ((bucket + ?) / ?) * ? - ? AS b, name, SUM(down) AS down, SUM(up) AS up "
+        "FROM usage WHERE bucket >= ? GROUP BY b, name ORDER BY b",
+        (offset, bucket, bucket, offset, since)).fetchall()
+    users = {}
+    for r in db.execute("SELECT name, SUM(down) AS down, SUM(up) AS up FROM usage WHERE bucket >= ? GROUP BY name", (since,)):
+        users[r["name"]] = {"name": r["name"], "down": r["down"], "up": r["up"], "connections": 0, "seconds": 0, "last": 0}
+    for r in db.execute("SELECT name, COUNT(*) AS n, SUM(ended - MAX(started, ?)) AS secs, MAX(ended) AS last "
+                        "FROM sessions WHERE ended >= ? GROUP BY name", (since, since)):
+        u = users.setdefault(r["name"], {"name": r["name"], "down": 0, "up": 0})
+        u.update(connections=r["n"], seconds=max(0, r["secs"] or 0), last=r["last"])
+    sessions = db.execute("SELECT name, source, started, ended, down, up, open FROM sessions "
+                          "WHERE ended >= ? ORDER BY started DESC LIMIT 5000", (since,)).fetchall()
+    meta = db.execute("SELECT value FROM meta WHERE key='since'").fetchone()
+    earlier = db.execute("SELECT DISTINCT name, source FROM sessions WHERE started < ?", (since,)).fetchall()
+    print(json.dumps({
+        "now": now, "since": since, "bucket": bucket,
+        "earlier_sources": [[r["name"], r["source"]] for r in earlier],
+        "recording_since": int(meta["value"]) if meta else None,
+        "retention_days": retention_days(),
+        "series": [[r["b"], r["name"], r["down"], r["up"]] for r in series],
+        "users": sorted(users.values(), key=lambda u: -(u["down"] + u["up"])),
+        "sessions": [dict(r) for r in sessions],
+    }))
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+
+
+def top(days):
+    db = connect()
+    since = int(time.time()) - days * 86400
+    print(f"{'USER':<16} {'DOWNLOADED':>12} {'UPLOADED':>12}   last {days} days")
+    for r in db.execute("SELECT name, SUM(down) AS d, SUM(up) AS u FROM usage WHERE bucket >= ? "
+                        "GROUP BY name ORDER BY d + u DESC", (since,)):
+        print(f"{r['name']:<16} {human(r['d']):>12} {human(r['u']):>12}")
+
+
+p = argparse.ArgumentParser()
+sub = p.add_subparsers(dest="cmd", required=True)
+sub.add_parser("collect")
+r = sub.add_parser("report")
+r.add_argument("--since", type=int, required=True)
+r.add_argument("--bucket", type=int, default=86400)
+r.add_argument("--offset", type=int, default=0)
+h = sub.add_parser("health")
+h.add_argument("--since", type=int, required=True)
+h.add_argument("--bucket", type=int, default=300)
+s = sub.add_parser("sites")
+s.add_argument("--since", type=int, required=True)
+t = sub.add_parser("top")
+t.add_argument("--days", type=int, default=30)
+a = p.parse_args()
+if a.cmd == "collect":
+    collect()
+elif a.cmd == "health":
+    health_report(a.since, max(60, a.bucket))
+elif a.cmd == "sites":
+    sites_report(a.since)
+elif a.cmd == "report":
+    report(a.since, max(BUCKET, a.bucket), a.offset)
+else:
+    top(a.days)

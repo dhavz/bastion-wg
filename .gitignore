@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# Secrets and local state — NEVER commit these.
+# Everything below is created at runtime on the machine that manages the VPN.
+# ---------------------------------------------------------------------------
+DOToken            # DigitalOcean API token
+keys/              # SSH key pair for the server (private key!)
+.state/            # droplet id, server IP, portal password, portal.db audit log
+profiles/          # per-user WireGuard profiles (.conf) and QR codes (private keys!)
+backups/           # server config archives (contain server + user keys)
+users.txt          # real roster: "Name: email" per line
+
+# Generated PDF is built with your real server IP — keep it out of git.
+docs/*.pdf
+
+# Build / OS leftovers
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

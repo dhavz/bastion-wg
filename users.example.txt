@@ -1,0 +1,4 @@
+# One person per line: Name: email
+# Only the name is sent to the server; the email is for your own records.
+Alice: alice@example.com
+Bob: bob@example.com

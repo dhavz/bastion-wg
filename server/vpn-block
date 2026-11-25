@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Runs ON THE SERVER as root (installed to /usr/local/sbin/vpn-block).
+
+Website blocking for VPN users, applied by the DNS resolver that already answers
+their lookups. Off unless switched on. Blocks apply to every user.
+
+  vpn-block show                 print the current settings as JSON
+  vpn-block set                  read new settings (JSON) from standard input and apply them
+  vpn-block refresh              re-download the lists in use (run daily by a systemd timer)
+  vpn-block update <list>        download one list now
+  vpn-block list <list> [--search TEXT] [--offset N] [--limit N]
+                                 print part of a list's contents as JSON
+
+Lists are the built-in ones below plus any added in the portal (a name and a link to a
+hosts file or a plain list of site names). Sites under "allowed" are never blocked by a
+list. Settings are kept in /etc/wireguard/blocking.json, so backups include them.
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+SETTINGS = "/etc/wireguard/blocking.json"
+LISTS = "/etc/vpn-block"
+CONF = "/etc/dnsmasq.d/vpn-block.conf"
+BASE = "https://raw.githubusercontent.com/StevenBlack/hosts/master/"
+BUILT_IN = {
+    "ads_malware": ("Advertising, trackers and malware", BASE + "hosts"),
+    "adult": ("Adult content", BASE + "alternates/porn-only/hosts"),
+    "gambling": ("Gambling", BASE + "alternates/gambling-only/hosts"),
+    "social": ("Social networks", BASE + "alternates/social-only/hosts"),
+}
+DOMAIN = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$")
+CUSTOM_KEY = re.compile(r"^custom_[a-z0-9]{1,24}$")
+URL = re.compile(r"^https://[^\s\"'<>]{4,500}$")
+MAX_BYTES = 40 * 1024 * 1024
+MAX_CUSTOM = 20
+
+
+def fail(msg):
+    print(f"vpn-block: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def logging_on():
+    try:
+        return bool(re.search(r'^LOG_WEBSITES="?yes', open("/etc/wireguard/vpn.env").read(), re.M))
+    except OSError:
+        return False
+
+
+def clean_domain(d):
+    d = str(d).strip().lower().rstrip(".")
+    d = re.sub(r"^(https?://)?(www\.)?", "", d).split("/")[0]
+    if not DOMAIN.match(d):
+        fail(f"'{d}' is not a valid site name")
+    return d
+
+
+def load():
+    try:
+        s = json.load(open(SETTINGS))
+    except (OSError, ValueError):
+        s = {}
+    custom = [c for c in s.get("custom", [])
+              if isinstance(c, dict) and CUSTOM_KEY.match(str(c.get("key", ""))) and URL.match(str(c.get("url", "")))]
+    known = set(BUILT_IN) | {c["key"] for c in custom}
+    return {"enabled": bool(s.get("enabled", False)),
+            "categories": [c for c in s.get("categories", []) if c in known],
+            "domains": sorted({d for d in s.get("domains", []) if DOMAIN.match(d)}),
+            "allowed": sorted({d for d in s.get("allowed", []) if DOMAIN.match(d)}),
+            "custom": custom}
+
+
+def catalog(s):
+    """key -> (label, link, added in the portal?) for every list."""
+    out = {k: (label, url, False) for k, (label, url) in BUILT_IN.items()}
+    for c in s["custom"]:
+        out[c["key"]] = (c["label"], c["url"], True)
+    return out
+
+
+def raw_path(key):
+    return f"{LISTS}/{key}.hosts"
+
+
+def active_path(key):
+    return f"{LISTS}/{key}.active"
+
+
+def read_hosts(key):
+    with open(raw_path(key)) as f:
+        return [l.split()[1] for l in f if l.strip()]
+
+
+def download(key, url, least):
+    """Fetch one list and keep only valid site names. Accepts a hosts file or one name per line."""
+    os.makedirs(LISTS, exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.7.1"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        text = r.read(MAX_BYTES + 1)
+    if len(text) > MAX_BYTES:
+        raise RuntimeError("the list is larger than 40 MB")
+    hosts, seen = [], set()
+    for line in text.decode("utf-8", "replace").splitlines():
+        parts = line.split("#")[0].split()
+        if not parts:
+            continue
+        if parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1"):
+            parts = parts[1:]
+        if len(parts) != 1:
+            continue
+        h = parts[0].lower().rstrip(".")
+        if h not in seen and DOMAIN.match(h):
+            seen.add(h)
+            hosts.append(h)
+    if len(hosts) < least:
+        raise RuntimeError("no site names were found at that link" if least == 1 else "the list came back nearly empty")
+    tmp = raw_path(key) + ".new"
+    with open(tmp, "w") as f:
+        f.write("".join(f"0.0.0.0 {h}\n" for h in hosts))
+    os.replace(tmp, raw_path(key))
+
+
+def fetch(s, key):
+    label, url, custom = catalog(s)[key]
+    download(key, url, 1 if custom else 100)
+
+
+def is_allowed(host, allowed):
+    parts = host.split(".")
+    return any(".".join(parts[i:]) in allowed for i in range(len(parts) - 1))
+
+
+def write_active(s, key):
+    """The copy the resolver reads: the downloaded list without the sites that are never blocked."""
+    allowed = set(s["allowed"])
+    tmp = active_path(key) + ".new"
+    with open(tmp, "w") as f:
+        f.write("".join(f"0.0.0.0 {h}\n" for h in read_hosts(key) if not (allowed and is_allowed(h, allowed))))
+    os.replace(tmp, active_path(key))
+
+
+def apply(s):
+    lines = ["# Written by vpn-block. Edit the settings in the web portal, not here."]
+    if s["enabled"]:
+        for d in s["domains"]:
+            lines.append(f"address=/{d}/#")          # the name and everything under it
+        for c in s["categories"]:
+            if not os.path.exists(raw_path(c)):
+                fetch(s, c)
+            write_active(s, c)
+            lines.append(f"addn-hosts={active_path(c)}")
+    with open(CONF, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    test = subprocess.run(["dnsmasq", "--test"], capture_output=True, text=True)
+    if test.returncode != 0:      # never leave the resolver unable to start
+        open(CONF, "w").write(lines[0] + "\n")
+        fail("the resolver rejected the new settings: " + test.stderr.strip()[-200:])
+    subprocess.run(["systemctl", "restart", "dnsmasq"], check=True)
+
+
+def save(s):
+    tmp = SETTINGS + ".new"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SETTINGS)
+
+
+def show():
+    s = load()
+    cats = []
+    for key, (label, url, custom) in catalog(s).items():
+        p = raw_path(key)
+        have = os.path.exists(p)
+        cats.append({"key": key, "label": label, "url": url, "custom": custom, "on": key in s["categories"],
+                     "sites": sum(1 for _ in open(p)) if have else None,
+                     "updated": int(os.path.getmtime(p)) if have else None})
+    print(json.dumps({"available": logging_on(), "enabled": s["enabled"], "domains": s["domains"],
+                      "allowed": s["allowed"], "categories": cats}))
+
+
+def option(name, default):
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv[:-1] else default
+
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "show":
+    show()
+elif cmd == "set":
+    if not logging_on():
+        fail("website blocking needs website logging (LOG_WEBSITES=\"yes\" in config.env)")
+    try:
+        new = json.load(sys.stdin)
+    except ValueError:
+        fail("the settings were not valid JSON")
+    old = load()
+    s = {"enabled": bool(new.get("enabled")),
+         "domains": sorted({clean_domain(d) for d in new.get("domains", [])}),
+         "allowed": sorted({clean_domain(d) for d in new["allowed"]}) if "allowed" in new else old["allowed"],
+         "custom": old["custom"]}
+    clash = set(s["domains"]) & set(s["allowed"])
+    if clash:
+        fail(f"'{sorted(clash)[0]}' is in both the blocked sites and the never-blocked sites. Remove it from one.")
+    added = []
+    if "custom" in new:
+        if len(new["custom"]) > MAX_CUSTOM:
+            fail(f"at most {MAX_CUSTOM} added lists are supported")
+        s["custom"] = []
+        for c in new["custom"]:
+            label, url = str(c.get("label", "")).strip()[:60], str(c.get("url", "")).strip()
+            if not label:
+                fail("give the list a name")
+            if not URL.match(url):
+                fail("the list's link must start with https://")
+            key = str(c.get("key") or "custom_" + hashlib.sha1(url.encode()).hexdigest()[:10])
+            if not CUSTOM_KEY.match(key) or key in {x["key"] for x in s["custom"]}:
+                fail("that list has already been added")
+            s["custom"].append({"key": key, "label": label, "url": url})
+            if key not in {x["key"] for x in old["custom"]}:
+                added.append(key)
+    known = set(catalog(s))
+    s["categories"] = [c for c in dict.fromkeys(new.get("categories", [])) if c in known]
+    try:
+        for key in added:                 # prove a new list can be read before keeping it
+            fetch(s, key)
+        apply(s)
+    except (OSError, RuntimeError, ValueError) as e:
+        for key in added:
+            if os.path.exists(raw_path(key)):
+                os.remove(raw_path(key))
+        fail(f"could not apply: {e}")
+    save(s)
+    for c in old["custom"]:               # tidy up after a removed list
+        if c["key"] not in known:
+            for p in (raw_path(c["key"]), active_path(c["key"])):
+                if os.path.exists(p):
+                    os.remove(p)
+    show()
+elif cmd == "refresh":
+    s = load()
+    if s["enabled"] and s["categories"]:
+        for c in s["categories"]:
+            try:
+                fetch(s, c)
+                write_active(s, c)
+            except Exception as e:   # keep the previous list if a download fails
+                print(f"vpn-block: {c}: {e}", file=sys.stderr)
+        subprocess.run(["systemctl", "restart", "dnsmasq"])
+elif cmd == "update" and len(sys.argv) > 2:
+    s = load()
+    key = sys.argv[2]
+    if key not in catalog(s):
+        fail("no such list")
+    try:
+        fetch(s, key)
+    except Exception as e:
+        fail(f"the list could not be downloaded: {e}")
+    if s["enabled"] and key in s["categories"]:
+        write_active(s, key)
+        subprocess.run(["systemctl", "restart", "dnsmasq"])
+    show()
+elif cmd == "list" and len(sys.argv) > 2:
+    s = load()
+    key = sys.argv[2]
+    if key not in catalog(s):
+        fail("no such list")
+    search = option("--search", "").lower()
+    offset, limit = max(0, int(option("--offset", "0"))), max(1, min(500, int(option("--limit", "50"))))
+    if not os.path.exists(raw_path(key)):
+        print(json.dumps({"downloaded": False, "total": 0, "matched": 0, "rows": []}))
+    else:
+        hosts = read_hosts(key)
+        allowed = set(s["allowed"])
+        hits = [h for h in hosts if search in h] if search else hosts
+        print(json.dumps({"downloaded": True, "total": len(hosts), "matched": len(hits),
+                          "rows": [[h, bool(allowed) and is_allowed(h, allowed)] for h in hits[offset:offset + limit]]}))
+else:
+    print(__doc__.strip())
+    sys.exit(1)

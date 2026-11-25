@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Runs ON THE SERVER as root (installed to /usr/local/sbin/vpn-status).
+Prints one JSON document describing server health and every VPN user.
+Read-only: used by the web portal."""
+import glob
+import json
+import os
+import re
+import subprocess
+import time
+
+WG = "/etc/wireguard"
+
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return ""
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+env = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', read(f"{WG}/vpn.env"), re.M))
+
+
+def peer_blocks(text):
+    """name -> public key, from '# BEGIN name ... # END name' blocks."""
+    out = {}
+    for name, body in re.findall(r"^# BEGIN (\S+)\n(.*?)^# END \1$", text, re.M | re.S):
+        m = re.search(r"^PublicKey = (\S+)", body, re.M)
+        if m:
+            out[name] = m.group(1)
+    return out
+
+
+active = peer_blocks(read(f"{WG}/wg0.conf"))
+suspended = {}
+for p in glob.glob(f"{WG}/disabled/*.peer"):
+    suspended.update(peer_blocks(read(p)))
+
+live = {}
+for line in sh("wg", "show", "wg0", "dump").splitlines()[1:]:
+    f = line.split("\t")
+    if len(f) >= 7:
+        live[f[0]] = {"endpoint": "" if f[2] == "(none)" else f[2],
+                      "handshake": int(f[4]), "rx": int(f[5]), "tx": int(f[6])}
+
+born = {}
+for line in sh("stat", "-c", "%n\t%W\t%Y", *glob.glob(f"{WG}/clients/*.conf")).splitlines():
+    n, w, y = line.split("\t")
+    born[os.path.basename(n)[:-5]] = int(w) or int(y)
+
+users = []
+for path in sorted(glob.glob(f"{WG}/clients/*.conf")):
+    name = os.path.basename(path)[:-5]
+    m = re.search(r"^Address = ([0-9.]+)", read(path), re.M)
+    pub = active.get(name) or suspended.get(name, "")
+    s = live.get(pub, {})
+    users.append({
+        "name": name, "ip": m.group(1) if m else "", "enabled": name in active,
+        "created": born.get(name, 0), "endpoint": s.get("endpoint", ""),
+        "handshake": s.get("handshake", 0),
+        "uploaded": s.get("rx", 0), "downloaded": s.get("tx", 0),
+    })
+
+wan = (sh("ip", "-4", "route", "show", "default").split("dev ")[1:] or ["eth0"])[0].split()[0]
+cpu = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:]]
+mem = {k: int(v) * 1024 for k, v in re.findall(r"^(\w+):\s+(\d+) kB", read("/proc/meminfo"), re.M)}
+st = os.statvfs("/")
+osrel = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', read("/etc/os-release"), re.M))
+
+print(json.dumps({
+    "time": time.time(),
+    "service": sh("systemctl", "is-active", "wg-quick@wg0").strip() or "unknown",
+    "boot_enabled": sh("systemctl", "is-enabled", "wg-quick@wg0").strip() == "enabled",
+    "uptime": float(read("/proc/uptime", "0").split()[0]),
+    "load": [float(x) for x in read("/proc/loadavg", "0 0 0").split()[:3]],
+    "cpus": os.cpu_count(),
+    "cpu_total": sum(cpu), "cpu_idle": cpu[3] + cpu[4],
+    "mem_total": mem.get("MemTotal", 0), "mem_available": mem.get("MemAvailable", 0),
+    "disk_total": st.f_blocks * st.f_frsize, "disk_free": st.f_bavail * st.f_frsize,
+    "net_rx": int(read(f"/sys/class/net/{wan}/statistics/rx_bytes", "0")),
+    "net_tx": int(read(f"/sys/class/net/{wan}/statistics/tx_bytes", "0")),
+    "reboot_required": os.path.exists("/var/run/reboot-required"),
+    "kernel": os.uname().release, "os": osrel.get("PRETTY_NAME", ""),
+    "server_ip": env.get("SERVER_IP", ""), "wg_port": env.get("WG_PORT", ""),
+    "client_port": env.get("CLIENT_PORT", env.get("WG_PORT", "")),
+    "dns": env.get("CLIENT_DNS", ""),
+    "site_logging": "off" if env.get("LOG_WEBSITES") != "yes" else (sh("systemctl", "is-active", "dnsmasq").strip() or "unknown"),
+    "usage_timer": sh("systemctl", "is-active", "vpn-usage.timer").strip() or "unknown",
+    "public_key": sh("wg", "show", "wg0", "public-key").strip(),
+    "users": users,
+}))
